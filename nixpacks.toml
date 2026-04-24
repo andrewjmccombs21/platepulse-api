@@ -4,9 +4,9 @@ nixPkgs = ["python311", "gcc", "gpp"]
 
 [phases.install]
 cmds = [
-  "pip install --upgrade pip",
-  "pip install torch==2.2.0 --index-url https://download.pytorch.org/whl/cpu",
-  "pip install -r requirements.txt"
+  "python3 -m pip install --upgrade pip",
+  "python3 -m pip install torch==2.2.0 --index-url https://download.pytorch.org/whl/cpu",
+  "python3 -m pip install -r requirements.txt"
 ]
 
 [start]
