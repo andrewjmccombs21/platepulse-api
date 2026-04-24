@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+model/
+training_data.json
+not_reviews.json
+.env
+*.env
+venv/
+.venv/
+static/
