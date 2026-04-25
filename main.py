@@ -25,7 +25,21 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 import io
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="Plate Pulse API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+import os as _os
+if _os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # CORS — allow requests from any origin (browser-based SaaS tool)
 app.add_middleware(
