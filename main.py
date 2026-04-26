@@ -879,7 +879,7 @@ async def claude_proxy(request: ClaudeRequest):
     if not ANTHROPIC_KEY:
         raise HTTPException(status_code=500, detail="Anthropic API key not configured on server.")
 
-    safe_tokens = min(request.max_tokens, 4000)
+    safe_tokens = min(request.max_tokens, 8000)
 
     payload = {
         "model": request.model,
