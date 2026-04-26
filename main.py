@@ -31,7 +31,14 @@ app = FastAPI(title="Plate Pulse API", version="1.0.0")
 # CORS — allow requests from any origin (browser-based SaaS tool)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://menupulse-beta.vercel.app",
+        "https://menupulse.vercel.app",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+        "null",  # local file:// access
+        "*"      # keep open during beta
+    ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
