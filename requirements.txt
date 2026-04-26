@@ -2,9 +2,6 @@ fastapi
 uvicorn
 requests
 httpx
-transformers
-torch
 pydantic
 reportlab
 outscraper
-google-search-results
