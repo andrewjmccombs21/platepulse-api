@@ -400,6 +400,42 @@ def model_status():
     return {"status": "Claude-based analysis — no local model required"}
 
 
+# ─── Google Places Autocomplete Proxy ────────────────────────────────────────
+
+GOOGLE_PLACES_KEY = os.environ.get("GOOGLE_PLACES_KEY", "")
+
+@app.get("/places/autocomplete")
+async def places_autocomplete(query: str):
+    """Proxy Google Places autocomplete for restaurant address suggestions."""
+    if not GOOGLE_PLACES_KEY:
+        # Return empty — frontend will use fallback suggestions
+        return []
+    try:
+        res = requests.get(
+            "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+            params={
+                "input":   query,
+                "types":   "establishment",
+                "keyword": "restaurant|food|cafe|bar|diner",
+                "key":     GOOGLE_PLACES_KEY
+            },
+            timeout=5
+        )
+        data = res.json()
+        predictions = data.get("predictions", [])
+        return [
+            {
+                "name":        p.get("structured_formatting", {}).get("main_text", p["description"]),
+                "description": p["description"],
+                "place_id":    p.get("place_id", "")
+            }
+            for p in predictions[:6]
+        ]
+    except Exception as e:
+        print(f"Places autocomplete error: {e}")
+        return []
+
+
 # ─── Scheduled Review Management ─────────────────────────────────────────────
 
 class ScheduledReviewRequest(BaseModel):
