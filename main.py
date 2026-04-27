@@ -8,10 +8,13 @@ from collections import Counter
 import re
 import os
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 import hashlib
 import hmac
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # PDF generation
 from reportlab.lib.pagesizes import letter
@@ -36,8 +39,141 @@ SERPAPI_KEY        = os.environ.get("SERPAPI_KEY", "")
 OUTSCRAPER_KEY     = os.environ.get("OUTSCRAPER_KEY", "")
 ANTHROPIC_KEY      = os.environ.get("ANTHROPIC_KEY", "")
 SUPABASE_URL       = os.environ.get("SUPABASE_URL", "")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")  # service role key for server-side writes
-EDI_WEBHOOK_SECRET = os.environ.get("EDI_WEBHOOK_SECRET", "menupulse-edi-secret")  # change in Railway vars
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+EDI_WEBHOOK_SECRET = os.environ.get("EDI_WEBHOOK_SECRET", "menupulse-edi-secret")
+
+# ── Scheduler ────────────────────────────────────────────────────────────────
+
+scheduler = AsyncIOScheduler()
+
+@app.on_event("startup")
+async def startup():
+    # Run monthly on the 1st at 6am UTC
+    scheduler.add_job(
+        monthly_review_pull,
+        CronTrigger(day=1, hour=6, minute=0),
+        id="monthly_review_pull",
+        replace_existing=True
+    )
+    scheduler.start()
+    print("Scheduler started — monthly review pull on 1st of each month at 6am UTC")
+
+@app.on_event("shutdown")
+async def shutdown():
+    scheduler.shutdown()
+
+async def monthly_review_pull():
+    """Pull reviews for all opted-in users and save sentiment history."""
+    print(f"[{datetime.now(timezone.utc).isoformat()}] Starting monthly review pull...")
+
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        print("Supabase not configured — skipping monthly pull")
+        return
+
+    # Get all scheduled review configs
+    url = f"{SUPABASE_URL}/rest/v1/scheduled_reviews"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"
+    }
+    res = requests.get(url, headers=headers, params={"enabled": "eq.true", "select": "*"}, timeout=10)
+    if res.status_code != 200:
+        print(f"Could not fetch scheduled reviews: {res.text}")
+        return
+
+    configs = res.json()
+    print(f"Found {len(configs)} users to pull reviews for")
+
+    for config in configs:
+        try:
+            await pull_reviews_for_user(config)
+            # Update last_pulled_at and next_pull_at
+            next_pull = (datetime.now(timezone.utc).replace(day=1) + timedelta(days=32)).replace(day=1)
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/scheduled_reviews",
+                headers={**headers, "Content-Type": "application/json"},
+                params={"user_id": f"eq.{config['user_id']}"},
+                json={"last_pulled_at": datetime.now(timezone.utc).isoformat(), "next_pull_at": next_pull.isoformat()},
+                timeout=10
+            )
+        except Exception as e:
+            print(f"Error pulling reviews for user {config['user_id']}: {e}")
+
+    print(f"Monthly review pull complete — processed {len(configs)} users")
+
+async def pull_reviews_for_user(config: dict):
+    """Fetch reviews via Outscraper, analyze with Claude, save to sentiment_history."""
+    user_id  = config["user_id"]
+    address  = config["google_address"]
+    rest_name = config.get("restaurant_name", address)
+    limit    = config.get("reviews_limit", 100)
+
+    print(f"Pulling reviews for {rest_name} ({address})")
+
+    # Fetch reviews from Outscraper
+    reviews, business_name = fetch_reviews_for_location(address)
+    if not reviews:
+        print(f"No reviews found for {address}")
+        return
+
+    # Build review text for Claude
+    review_text = "\n\n".join([f"Rating: {r.get('rating','?')}/5\n{r['text']}" for r in reviews[:100]])
+
+    # Analyze with Claude — two calls matching the frontend pattern
+    headers_claude = {
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    sys1 = f"""You are an expert restaurant review analyst. Analyze the reviews provided.
+Return ONLY valid JSON (no markdown, no trailing commas):
+{{"overall":"Positive|Mixed|Negative","score":7.5,"review_count":{len(reviews)},"summary":"2-3 sentence summary","positives":[{{"theme":"Food quality","detail":"Brief detail"}}],"negatives":[{{"theme":"Wait times","detail":"Brief detail"}}],"competitive_notes":null}}
+Rules: score 0-10. positives 3-5 items. negatives 3-5 items. Keep strings concise. Return ONLY JSON."""
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r1 = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            json={"model": "claude-sonnet-4-6", "max_tokens": 1500, "system": sys1,
+                  "messages": [{"role": "user", "content": f"Restaurant: {rest_name}\n\nReviews:\n{review_text[:8000]}"}]},
+            headers=headers_claude
+        )
+
+    if r1.status_code != 200:
+        print(f"Claude API error for {rest_name}: {r1.text[:200]}")
+        return
+
+    raw1   = r1.json().get("content", [{}])[0].get("text", "")
+    s, en  = raw1.find("{"), raw1.rfind("}")
+    part1  = json.loads(raw1[s:en+1].replace(",\n}", "\n}")) if s > -1 else {}
+
+    # Save to sentiment_history via Supabase service role
+    history_row = {
+        "user_id":      user_id,
+        "restaurant":   business_name or rest_name,
+        "score":        part1.get("score", 0),
+        "overall":      part1.get("overall", "Unknown"),
+        "review_count": len(reviews),
+        "positives":    part1.get("positives", []),
+        "negatives":    part1.get("negatives", []),
+        "analyzed_at":  datetime.now(timezone.utc).isoformat()
+    }
+
+    sb_headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json"
+    }
+    res = requests.post(
+        f"{SUPABASE_URL}/rest/v1/sentiment_history",
+        json=history_row,
+        headers=sb_headers,
+        timeout=10
+    )
+    if res.status_code in (200, 201):
+        print(f"✓ Saved sentiment history for {rest_name}: {part1.get('score')}/10 {part1.get('overall')}")
+    else:
+        print(f"Failed to save history for {rest_name}: {res.text[:200]}")
 
 # ─── Review Fetching ──────────────────────────────────────────────────────────
 
@@ -264,6 +400,63 @@ def model_status():
     return {"status": "Claude-based analysis — no local model required"}
 
 
+# ─── Scheduled Review Management ─────────────────────────────────────────────
+
+class ScheduledReviewRequest(BaseModel):
+    user_id: str
+    restaurant_name: str
+    google_address: str
+    reviews_limit: int = 100
+
+@app.post("/scheduled/reviews/register")
+async def register_scheduled_review(req: ScheduledReviewRequest):
+    """Register or update a user's monthly review pull config."""
+    next_pull = (datetime.now(timezone.utc).replace(day=1) + timedelta(days=32)).replace(day=1)
+    row = {
+        "user_id":         req.user_id,
+        "restaurant_name": req.restaurant_name,
+        "google_address":  req.google_address,
+        "reviews_limit":   req.reviews_limit,
+        "next_pull_at":    next_pull.isoformat(),
+        "enabled":         True
+    }
+    success = supabase_upsert("scheduled_reviews", [row], on_conflict="user_id")
+    return {"success": success, "next_pull_at": next_pull.isoformat()}
+
+@app.get("/scheduled/reviews/status/{user_id}")
+async def scheduled_review_status(user_id: str):
+    """Get a user's scheduled review config."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return {"registered": False}
+    url = f"{SUPABASE_URL}/rest/v1/scheduled_reviews"
+    headers = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+    res = requests.get(url, headers=headers, params={"user_id": f"eq.{user_id}", "select": "*"}, timeout=10)
+    data = res.json()
+    if data:
+        return {"registered": True, **data[0]}
+    return {"registered": False}
+
+@app.post("/scheduled/reviews/trigger/{user_id}")
+async def trigger_review_pull(user_id: str, background_tasks: BackgroundTasks):
+    """Manually trigger a review pull for a single user (for testing)."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    url = f"{SUPABASE_URL}/rest/v1/scheduled_reviews"
+    headers = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+    res = requests.get(url, headers=headers, params={"user_id": f"eq.{user_id}", "select": "*"}, timeout=10)
+    data = res.json()
+    if not data:
+        raise HTTPException(status_code=404, detail="No scheduled review config found for this user")
+    background_tasks.add_task(pull_reviews_for_user, data[0])
+    return {"success": True, "message": "Review pull triggered in background"}
+
+@app.post("/scheduled/reviews/run-all")
+async def trigger_all_review_pulls(background_tasks: BackgroundTasks):
+    """Admin endpoint to manually run the monthly pull for all users."""
+    background_tasks.add_task(monthly_review_pull)
+    return {"success": True, "message": "Monthly review pull triggered for all users"}
+
+
 # ─── Supabase Helper ──────────────────────────────────────────────────────────
 
 def supabase_insert(table: str, rows: list):
@@ -355,7 +548,7 @@ async def toast_connect(req: ToastConnectRequest):
 
 @app.post("/integrations/toast/sync")
 async def toast_sync(req: ToastSyncRequest):
-    """Pull menu items and recent sales from Toast."""
+    """Pull menu items, recent sales, and server performance from Toast."""
     headers = {
         "Authorization": f"Bearer {req.access_token}",
         "Toast-Restaurant-External-ID": req.restaurant_guid
@@ -363,19 +556,26 @@ async def toast_sync(req: ToastSyncRequest):
     base = "https://ws-api.toasttab.com"
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            # Fetch menu items
-            menu_res = await client.get(f"{base}/menus/v2/menus", headers=headers)
-            # Fetch recent orders (last 30 days)
-            from_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00.000+0000")
-            orders_res = await client.get(
-                f"{base}/orders/v2/ordersBulk",
-                headers=headers,
-                params={"startDate": from_date, "pageSize": 100}
-            )
+        from_date_30 = (datetime.now(timezone.utc) - __import__('datetime').timedelta(days=30)).strftime("%Y-%m-%dT00:00:00.000+0000")
+        from_date_7  = (datetime.now(timezone.utc) - __import__('datetime').timedelta(days=7)).strftime("%Y-%m-%dT00:00:00.000+0000")
 
-        menu_data   = menu_res.json()   if menu_res.status_code   == 200 else {}
-        orders_data = orders_res.json() if orders_res.status_code == 200 else []
+        async with httpx.AsyncClient(timeout=30) as client:
+            menu_res     = await client.get(f"{base}/menus/v2/menus", headers=headers)
+            orders_res   = await client.get(f"{base}/orders/v2/ordersBulk", headers=headers,
+                             params={"startDate": from_date_30, "pageSize": 500})
+            employees_res = await client.get(f"{base}/employees/v1/employees", headers=headers)
+
+        menu_data      = menu_res.json()      if menu_res.status_code      == 200 else {}
+        orders_data    = orders_res.json()    if orders_res.status_code    == 200 else []
+        employees_data = employees_res.json() if employees_res.status_code == 200 else []
+
+        # Build employee name lookup
+        emp_names = {}
+        for emp in (employees_data if isinstance(employees_data, list) else []):
+            guid = emp.get("guid", "")
+            first = emp.get("firstName", "")
+            last  = emp.get("lastName", "")
+            emp_names[guid] = f"{first} {last}".strip() or guid
 
         # Parse menu items
         items = []
@@ -389,26 +589,73 @@ async def toast_sync(req: ToastSyncRequest):
                         "category": group.get("name", ""),
                     })
 
-        # Parse sales by item
+        # Parse sales by item + server stats
         sales = {}
-        for order in (orders_data if isinstance(orders_data, list) else []):
+        server_stats_30 = {}  # { server_guid: { checks, total_sales, total_items, covers } }
+        server_stats_7  = {}
+
+        orders_list = orders_data if isinstance(orders_data, list) else []
+        for order in orders_list:
+            order_date = order.get("createdDate", "")
+            is_last_7  = order_date >= from_date_7
+
             for check in order.get("checks", []):
+                server_guid = check.get("appliedServiceCharges", [{}])[0].get("server", {}).get("guid", "") \
+                              if check.get("appliedServiceCharges") else ""
+                # Try top-level server field
+                if not server_guid:
+                    server_guid = order.get("server", {}).get("guid", "") or \
+                                  check.get("createdDevice", {}).get("id", "unknown")
+
+                check_amount = check.get("totalAmount", 0) or 0
+                num_items    = len(check.get("selections", []))
+
+                for period_stats in [server_stats_30] + ([server_stats_7] if is_last_7 else []):
+                    if server_guid not in period_stats:
+                        period_stats[server_guid] = {"checks": 0, "total_sales": 0, "total_items": 0}
+                    period_stats[server_guid]["checks"]      += 1
+                    period_stats[server_guid]["total_sales"] += check_amount
+                    period_stats[server_guid]["total_items"] += num_items
+
                 for sel in check.get("selections", []):
                     guid = sel.get("itemGuid", "")
                     if guid:
                         sales[guid] = sales.get(guid, 0) + 1
 
-        # Combine
-        result = []
-        for item in items:
-            result.append({
-                **item,
-                "units_sold_30d": sales.get(item["guid"], 0)
+        # Combine menu items
+        result = [{ **item, "units_sold_30d": sales.get(item["guid"], 0) } for item in items]
+
+        # Build server performance rows
+        server_rows = []
+        all_server_guids = set(server_stats_30.keys())
+        team_avg_check_30 = (
+            sum(s["total_sales"] / max(s["checks"], 1) for s in server_stats_30.values()) / len(server_stats_30)
+            if server_stats_30 else 0
+        )
+        for guid in all_server_guids:
+            s30 = server_stats_30.get(guid, {})
+            s7  = server_stats_7.get(guid, {})
+            avg_check_30 = s30["total_sales"] / max(s30["checks"], 1) if s30.get("checks") else 0
+            avg_check_7  = s7["total_sales"]  / max(s7["checks"],  1) if s7.get("checks")  else 0
+            server_rows.append({
+                "user_id":          req.user_id,
+                "provider":         "toast",
+                "server_guid":      guid,
+                "server_name":      emp_names.get(guid, f"Server {guid[:6]}"),
+                "checks_30d":       s30.get("checks", 0),
+                "total_sales_30d":  round(s30.get("total_sales", 0), 2),
+                "avg_check_30d":    round(avg_check_30, 2),
+                "items_per_check_30d": round(s30["total_items"] / max(s30["checks"], 1), 2) if s30.get("checks") else 0,
+                "checks_7d":        s7.get("checks", 0),
+                "total_sales_7d":   round(s7.get("total_sales", 0), 2),
+                "avg_check_7d":     round(avg_check_7, 2),
+                "vs_team_avg_pct":  round((avg_check_30 - team_avg_check_30) / max(team_avg_check_30, 1) * 100, 1),
+                "synced_at":        datetime.now(timezone.utc).isoformat()
             })
 
-        # Store in Supabase pos_items table
+        # Store in Supabase
         if result and req.user_id:
-            rows = [{
+            item_rows = [{
                 "user_id":        req.user_id,
                 "provider":       "toast",
                 "item_guid":      i["guid"],
@@ -418,12 +665,17 @@ async def toast_sync(req: ToastSyncRequest):
                 "units_sold_30d": i["units_sold_30d"],
                 "synced_at":      datetime.now(timezone.utc).isoformat()
             } for i in result]
-            supabase_upsert("pos_items", rows, on_conflict="user_id,provider,item_guid")
+            supabase_upsert("pos_items", item_rows, on_conflict="user_id,provider,item_guid")
+
+        if server_rows:
+            supabase_upsert("server_stats", server_rows, on_conflict="user_id,provider,server_guid")
 
         return {
             "success": True,
-            "items_synced": len(result),
-            "items": result[:50]  # return first 50 for display
+            "items_synced":   len(result),
+            "servers_synced": len(server_rows),
+            "items":          result[:50],
+            "servers":        server_rows
         }
 
     except Exception as e:
